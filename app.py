@@ -5,12 +5,8 @@ import requests
 from bs4 import BeautifulSoup
 from difflib import get_close_matches
 
-# Vercel-এ হোস্ট করার জন্য প্রজেক্ট ফোল্ডার স্ট্রাকচার ঠিক করা
-# Vercel-এর রুটে app.py ফাইলটি থাকবে, তাই sys.path এর প্রয়োজন নেই।
-
 app = Flask(__name__)
 
-# সকল দেশের তালিকা (Country Code, Country Name, URL Part)
 countries_data = [
     {"code": "ar", "name": "argentina", "url_part": "argentina"},
     {"code": "am", "name": "armenia", "url_part": "armenia"},
@@ -90,12 +86,10 @@ def get_country_info(query):
     """
     query = query.lower()
     
-    # প্রথমে কোড বা নাম দিয়ে সরাসরি মিল খোঁজা
     for country in countries_data:
         if country["code"] == query or country["name"] == query:
             return country
     
-    # যদি সরাসরি মিল না পাওয়া যায়, তাহলে সবচেয়ে কাছাকাছি মিল খোঁজা
     all_names = [c["name"] for c in countries_data]
     close_matches = get_close_matches(query, all_names, n=1, cutoff=0.6)
     if close_matches:
@@ -105,6 +99,49 @@ def get_country_info(query):
                 return {"error": "not_found", "suggestion": country["name"]}
     
     return None
+
+def parse_table_data(table):
+    """
+    একটি HTML টেবিল থেকে ডেটা পার্স করে একটি ডিকশনারি হিসেবে ফেরত দেয়।
+    """
+    data = {}
+    rows = table.find_all('tr')
+    for row in rows:
+        cols = row.find_all(['th', 'td'])
+        
+        # টেবিল রো-তে দুটি কলামের ডেটা এক্সট্র্যাক্ট করা
+        # প্রতিটি row-তে দুটি করে key-value জোড়া থাকতে পারে
+        for i in range(0, len(cols), 2):
+            if len(cols) > i + 1:
+                key_tag = cols[i]
+                value_tag = cols[i+1]
+                
+                key = key_tag.get_text(strip=True).replace(" ", "_").replace("(", "").replace(")", "").replace("'", "").lower().strip()
+                
+                value = None
+                
+                # Check for <span> tag first
+                span_tag = value_tag.find('span')
+                if span_tag:
+                    value = span_tag.get_text(strip=True)
+                
+                # Handle special cases like Email and Credit Card Type images
+                if not value:
+                    img_tag = value_tag.find('img')
+                    if img_tag and img_tag.parent.get_text(strip=True):
+                        # For cases like Credit Card Type with image and text
+                        value = img_tag.parent.get_text(strip=True)
+                    else:
+                        email_tag = value_tag.find('a', class_='__cf_email__')
+                        if email_tag:
+                            value = "Email obfuscated (unable to decode)"
+                        else:
+                            # For cases where there's no span tag, get direct text
+                            value = value_tag.get_text(strip=True)
+
+                data[key] = value if value else None
+                
+    return data
 
 def scrape_data(url):
     """
@@ -119,35 +156,29 @@ def scrape_data(url):
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # HTML টেবিল থেকে ডেটা পার্স করা
-        table = soup.find('table', class_='table table-striped')
-        if not table:
+        scraped_data = {}
+        
+        # সমস্ত কার্ড সেকশন খুঁজে বের করা
+        card_sections = soup.find_all('div', class_='card')
+        
+        for card in card_sections:
+            header_tag = card.find('div', class_='card-header')
+            table_tag = card.find('table', class_='table table-striped')
+            
+            if header_tag and table_tag:
+                # হেডার থেকে সেকশনের নাম বের করা
+                section_name = header_tag.find('strong').get_text(strip=True)
+                
+                # টেবিল থেকে ডেটা পার্স করা
+                table_data = parse_table_data(table_tag)
+                
+                # ডেটা সেকশন নামে সেভ করা
+                scraped_data[section_name.replace(" ", "_")] = table_data
+                
+        if not scraped_data:
             return {"error": "ওয়েবসাইট থেকে ডেটা পাওয়া যায়নি।"}
             
-        data = {}
-        rows = table.find_all('tr')
-        for row in rows:
-            cols = row.find_all(['th', 'td'])
-            
-            # ডেটা এক্সট্র্যাক্ট করা
-            for i in range(0, len(cols), 2):
-                if len(cols) > i + 1:
-                    key = cols[i].get_text(strip=True).replace(" ", "_").lower().strip()
-                    value_tag = cols[i+1].find('span')
-                    if value_tag:
-                        value = value_tag.get_text(strip=True)
-                        data[key] = value
-                    else:
-                        # ইমেলের মতো বিশেষ ক্ষেত্রে
-                        email_tag = cols[i+1].find('a', class_='__cf_email__')
-                        if email_tag:
-                            # এখানে ইমেল ডিকোড করার জন্য JavaScript এর লজিক দরকার।
-                            # যেহেতু এটি কঠিন, তাই আপাতত placeholder রাখা হলো।
-                            data[key] = "Email obfuscated (unable to decode)"
-                        else:
-                            data[key] = cols[i+1].get_text(strip=True)
-
-        return data
+        return scraped_data
         
     except requests.exceptions.RequestException as e:
         return {"error": f"ওয়েবসাইট অ্যাক্সেস করতে সমস্যা হয়েছে: {str(e)}"}
@@ -164,14 +195,11 @@ def api_handler():
     country_info = get_country_info(country_query)
 
     if not country_info:
-        # কোনো মিল পাওয়া যায়নি
         return jsonify({"error": "আপনার দেওয়া কান্ট্রিটি খুঁজে পাওয়া যায়নি।", "suggestion": None}), 404
     
     if "suggestion" in country_info:
-        # কাছাকাছি একটি মিল পাওয়া গেছে
         return jsonify({"error": "আপনার দেওয়া কান্ট্রিটি খুঁজে পাওয়া যায়নি।", "suggestion": f"আপনি কি {country_info['suggestion']} খুঁজছেন?"}), 404
 
-    # সফলভাবে কান্ট্রি খুঁজে পাওয়া গেছে
     url_part = country_info["url_part"]
     full_url = f"https://outputter.io/full-identity/{url_part}/"
     
@@ -189,7 +217,3 @@ def home():
         "usage": "Use /api?country=<country_code_or_name> to get identity data",
         "example": "/api?country=bd or /api?country=bangladesh"
     })
-    
-# Vercel-এর জন্য `app` অবজেক্ট এক্সপোর্ট করা হয়
-# if __name__ == '__main__':
-#     app.run(debug=True)
